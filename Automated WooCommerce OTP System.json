@@ -1,0 +1,695 @@
+{
+  "name": "Automated WooCommerce OTP System",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "woocommerce-new-order",
+        "options": {}
+      },
+      "id": "6f4bb587-6223-4298-b570-8ba688816d97",
+      "name": "WooCommerce: New Order",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1104,
+        192
+      ],
+      "webhookId": "woo-order-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract & normalize order data from WooCommerce webhook\nconst order = $input.first().json;\n\nconst customerData = {\n  orderId: order.id || order.order_id,\n  orderStatus: order.status,\n  paymentMethod: order.payment_method,\n  orderTotal: parseFloat(order.total || 0),\n  currency: order.currency || 'BDT',\n\n  // Billing info\n  firstName: order.billing?.first_name || '',\n  lastName: order.billing?.last_name || '',\n  fullName: `${order.billing?.first_name || ''} ${order.billing?.last_name || ''}`.trim(),\n  email: order.billing?.email || '',\n  phone: order.billing?.phone || '',\n  address: order.billing?.address_1 || '',\n  city: order.billing?.city || '',\n  country: order.billing?.country || 'BD',\n\n  // Items\n  items: (order.line_items || []).map(item => ({\n    name: item.name,\n    qty: item.quantity,\n    price: parseFloat(item.price || 0)\n  })),\n  totalItems: (order.line_items || []).reduce((sum, i) => sum + i.quantity, 0),\n\n  // Meta\n  isCOD: order.payment_method === 'cod',\n  orderDate: order.date_created || new Date().toISOString(),\n  ipAddress: order.customer_ip_address || ''\n};\n\nreturn [{ json: customerData }];"
+      },
+      "id": "b06a65a2-cdd6-471c-8759-8da0dbc53ce5",
+      "name": "Get Customer Details",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Data Enrichment & Validation\nconst data = $input.first().json;\n\n// Phone normalization (BD format)\nlet phone = data.phone?.replace(/\\D/g, '') || '';\nif (phone.startsWith('0')) phone = '880' + phone.slice(1);\nif (!phone.startsWith('880') && phone.length === 10) phone = '880' + phone;\n\n// Validate phone\nconst validPhone = /^880[0-9]{10}$/.test(phone);\n\n// Email validation\nconst validEmail = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(data.email || '');\n\n// Risk scoring\nlet riskScore = 0;\nconst riskFlags = [];\n\n// COD orders = higher risk\nif (data.isCOD) { riskScore += 20; riskFlags.push('COD_ORDER'); }\n\n// High value order\nif (data.orderTotal > 5000) { riskScore += 15; riskFlags.push('HIGH_VALUE'); }\n\n// Invalid phone\nif (!validPhone) { riskScore += 40; riskFlags.push('INVALID_PHONE'); }\n\n// Invalid email\nif (!validEmail) { riskScore += 25; riskFlags.push('INVALID_EMAIL'); }\n\n// Missing address\nif (!data.address || data.address.length < 5) { riskScore += 20; riskFlags.push('INCOMPLETE_ADDRESS'); }\n\n// Very high order total with COD\nif (data.isCOD && data.orderTotal > 10000) { riskScore += 30; riskFlags.push('HIGH_VALUE_COD'); }\n\nreturn [{\n  json: {\n    ...data,\n    phone,\n    normalizedPhone: phone,\n    validPhone,\n    validEmail,\n    riskScore,\n    riskFlags,\n    enrichedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "e3384cd2-1425-4786-9f61-a0d011fc66c9",
+      "name": "Data Enrichment & Validation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.fraudlabs.com/v1/order/screen",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "X-API-KEY",
+              "value": "YOUR_FRAUDLABS_API_KEY"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "ip_address",
+              "value": "={{ $json.ipAddress }}"
+            },
+            {
+              "name": "bill_addr",
+              "value": "={{ $json.address }}"
+            },
+            {
+              "name": "bill_city",
+              "value": "={{ $json.city }}"
+            },
+            {
+              "name": "bill_country",
+              "value": "={{ $json.country }}"
+            },
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            },
+            {
+              "name": "amount",
+              "value": "={{ $json.orderTotal }}"
+            },
+            {
+              "name": "currency",
+              "value": "={{ $json.currency }}"
+            },
+            {
+              "name": "phone",
+              "value": "={{ $json.normalizedPhone }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 8000
+        }
+      },
+      "id": "00df4d8f-6a15-493b-abc2-e624d962cd54",
+      "name": "Fraud Check (Third-Party API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -640,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge fraud check result with customer data\nconst customer = $('Get Customer Details').first().json;\nconst enriched = $('Data Enrichment & Validation').first().json;\nlet fraudResult = {};\n\ntry {\n  fraudResult = $input.first().json;\n} catch(e) {\n  fraudResult = { fraudScore: 0, status: 'UNKNOWN' };\n}\n\n// Combine risk scores\nconst fraudApiScore = fraudResult.fraudlabspro_score || fraudResult.score || 0;\nconst totalRisk = Math.min(100, enriched.riskScore + (fraudApiScore * 0.3));\n\nconst isFraudulent = totalRisk >= 60 \n  || fraudResult.fraudlabspro_status === 'REJECT'\n  || (enriched.isCOD && !enriched.validPhone);\n\nreturn [{\n  json: {\n    ...enriched,\n    fraudApiScore,\n    totalRiskScore: Math.round(totalRisk),\n    isFraudulent,\n    fraudStatus: fraudResult.fraudlabspro_status || 'REVIEW',\n    needsOTP: !isFraudulent && enriched.validPhone && enriched.isCOD,\n    checkedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "fe60a583-cc0e-4a3f-9ef2-a38aa0a26269",
+      "name": "Merge Fraud Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -448,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond_fraud",
+              "leftValue": "={{ $json.isFraudulent }}",
+              "rightValue": false,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "f0fa3752-a9aa-41d5-accd-4df5fe4323e2",
+      "name": "Conditional Logic",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -224,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Generate OTP and prepare WhatsApp message\nconst data = $input.first().json;\n\n// Generate 6-digit OTP\nconst otp = Math.floor(100000 + Math.random() * 900000).toString();\nconst otpExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString(); // 10 min\n\n// Format order items\nconst itemsList = (data.items || []).map(i => `• ${i.name} × ${i.qty}`).join('\\n');\n\nconst whatsappMessage = `🛒 *Order Confirmation - OTP Required*\n\nDear *${data.fullName}*,\n\nYour order *#${data.orderId}* has been received!\n\n📦 *Order Summary:*\n${itemsList}\n\n💰 *Total: ${data.currency} ${data.orderTotal}*\n📍 *Delivery: ${data.city}*\n\n🔐 *Your OTP: ${otp}*\n⏱ Valid for 10 minutes only\n\nReply with this OTP to confirm your order. If you did not place this order, please ignore.\n\n_Powered by AutoVerify_`;\n\nreturn [{\n  json: {\n    ...data,\n    otp,\n    otpExpiry,\n    whatsappMessage,\n    whatsappPhone: `+${data.normalizedPhone}`,\n    channel: 'whatsapp'\n  }\n}];"
+      },
+      "id": "e742bb31-e3e2-4a02-82f1-f78330e5606b",
+      "name": "Generate WhatsApp Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v18.0/YOUR_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_WHATSAPP_TOKEN"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": \"{{ $json.whatsappPhone }}\",\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": {{ JSON.stringify($json.whatsappMessage) }}\n  }\n}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "774c9de7-20f2-44bb-9a8c-ff34385512f1",
+      "name": "WhatsApp API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        224,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Flag fraudulent order for manual review\nconst data = $input.first().json;\n\nconst reviewNote = {\n  orderId: data.orderId,\n  customer: data.fullName,\n  phone: data.normalizedPhone,\n  email: data.email,\n  orderTotal: `${data.currency} ${data.orderTotal}`,\n  riskScore: data.totalRiskScore,\n  riskFlags: (data.riskFlags || []).join(', '),\n  fraudStatus: data.fraudStatus,\n  isCOD: data.isCOD,\n  flaggedAt: new Date().toISOString(),\n  action: 'MANUAL_REVIEW_REQUIRED'\n};\n\nconsole.log('🚨 Flagged for review:', JSON.stringify(reviewNote));\n\n// Update WooCommerce order status to on-hold\nreturn [{ json: { ...data, reviewNote, orderFlagged: true } }];"
+      },
+      "id": "60802446-df08-4177-9a65-ddf0c2fffbe1",
+      "name": "Flag Order for Review",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        0,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://YOUR_STORE.com/wp-json/wc/v3/orders/{{ $json.orderId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Basic YOUR_WC_BASE64_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"status\": \"on-hold\",\n  \"customer_note\": \"Order flagged for fraud review. Risk Score: {{ $json.totalRiskScore }}/100. Flags: {{ ($json.riskFlags || []).join(', ') }}\"\n}",
+        "options": {}
+      },
+      "id": "75c687f4-248c-4337-bbda-e1a6a43a2061",
+      "name": "Update WC Order to On-Hold",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        224,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify & normalize phone for SMS\nconst data = $('Data Enrichment & Validation').first().json;\n\nconst phone = data.normalizedPhone;\nconst isValid = data.validPhone;\n\nif (!isValid) {\n  throw new Error(`Invalid phone number: ${phone} for order #${data.orderId}`);\n}\n\n// Generate OTP for SMS (same or new depending on flow)\nconst otp = Math.floor(100000 + Math.random() * 900000).toString();\nconst otpExpiry = new Date(Date.now() + 10 * 60 * 1000).toISOString();\n\nreturn [{\n  json: {\n    ...data,\n    otp,\n    otpExpiry,\n    smsPhone: phone,\n    phoneVerified: true\n  }\n}];"
+      },
+      "id": "7660cb95-dc15-48b9-a594-c10237840b99",
+      "name": "Verify Phone Number",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -656,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare SMS body\nconst data = $input.first().json;\n\nconst smsBody = `[${data.orderId}] OTP: ${data.otp}. Confirm your COD order of ${data.currency} ${data.orderTotal}. Valid 10 mins. Do not share. -AutoVerify`;\n\nreturn [{\n  json: {\n    ...data,\n    smsBody,\n    smsTo: data.smsPhone,\n    smsPreparedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "fb592677-4ee4-4060-9bf3-e5ca1dfb921a",
+      "name": "Prepare SMS Notification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -464,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://bulksmsbd.net/api/smsapi",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "api_key",
+              "value": "YOUR_BULKSMS_API_KEY"
+            },
+            {
+              "name": "type",
+              "value": "text"
+            },
+            {
+              "name": "number",
+              "value": "={{ $json.smsTo }}"
+            },
+            {
+              "name": "senderid",
+              "value": "AutoVerify"
+            },
+            {
+              "name": "message",
+              "value": "={{ $json.smsBody }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "64064914-1561-42cb-963f-d150a1b59ba5",
+      "name": "SMS Gateway",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -256,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Store OTP in database / cache for verification\n// Using n8n's built-in static data or external Redis\nconst whatsappData = $('Generate WhatsApp Message').first()?.json || {};\nconst smsData = $('Verify Phone Number').first()?.json || {};\n\nconst otpRecord = {\n  orderId: whatsappData.orderId || smsData.orderId,\n  phone: whatsappData.normalizedPhone || smsData.normalizedPhone,\n  otp: whatsappData.otp || smsData.otp,\n  otpExpiry: whatsappData.otpExpiry || smsData.otpExpiry,\n  channels: ['whatsapp', 'sms'],\n  status: 'PENDING',\n  attempts: 0,\n  createdAt: new Date().toISOString()\n};\n\n// In production: store in Redis/DB\n// await $redis.set(`otp:${otpRecord.orderId}`, JSON.stringify(otpRecord), 'EX', 600);\n\nconsole.log('OTP Record saved:', JSON.stringify(otpRecord));\nreturn [{ json: otpRecord }];"
+      },
+      "id": "5f5a62d7-4b99-45ff-b0b3-7c7c3d896f55",
+      "name": "Save OTP to DB",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -48,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://YOUR_CRM_API.com/api/orders",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_CRM_TOKEN"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"orderId\": \"{{ $json.orderId }}\",\n  \"customer\": {\n    \"name\": \"{{ $json.fullName }}\",\n    \"phone\": \"{{ $json.normalizedPhone }}\",\n    \"email\": \"{{ $json.email }}\",\n    \"city\": \"{{ $json.city }}\"\n  },\n  \"order\": {\n    \"total\": {{ $json.orderTotal }},\n    \"currency\": \"{{ $json.currency }}\",\n    \"isCOD\": {{ $json.isCOD }},\n    \"itemCount\": {{ $json.totalItems }}\n  },\n  \"verification\": {\n    \"status\": \"OTP_SENT\",\n    \"channels\": [\"whatsapp\", \"sms\"],\n    \"riskScore\": {{ $json.totalRiskScore || 0 }},\n    \"sentAt\": \"{{ $now.toISO() }}\"\n  }\n}",
+        "options": {}
+      },
+      "id": "8e8f3b65-ae73-422c-b992-7ca15710cda7",
+      "name": "CRM Update & Analytics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        224,
+        432
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "verify-otp",
+        "options": {}
+      },
+      "id": "ec0f3141-9ec8-41cb-af93-0786f2896a5b",
+      "name": "OTP Verification Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1104,
+        720
+      ],
+      "webhookId": "otp-verify-webhook"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Verify OTP submitted by customer\nconst body = $input.first().json;\nconst { orderId, otp: submittedOtp } = body;\n\n// In production: fetch from Redis/DB\n// const record = JSON.parse(await $redis.get(`otp:${orderId}`));\n\n// Mock DB check (replace with real DB fetch)\nconst mockRecord = {\n  otp: body.expectedOtp || '123456',\n  otpExpiry: new Date(Date.now() + 5 * 60 * 1000).toISOString(),\n  attempts: 0\n};\n\nconst now = new Date();\nconst isExpired = new Date(mockRecord.otpExpiry) < now;\nconst isMatch = mockRecord.otp === submittedOtp;\nconst maxAttempts = mockRecord.attempts >= 3;\n\nlet verificationResult;\nif (isExpired) {\n  verificationResult = { success: false, reason: 'OTP_EXPIRED', orderId };\n} else if (maxAttempts) {\n  verificationResult = { success: false, reason: 'MAX_ATTEMPTS_EXCEEDED', orderId };\n} else if (!isMatch) {\n  verificationResult = { success: false, reason: 'INVALID_OTP', orderId, attempts: mockRecord.attempts + 1 };\n} else {\n  verificationResult = { success: true, reason: 'VERIFIED', orderId, verifiedAt: now.toISOString() };\n}\n\nreturn [{ json: verificationResult }];"
+      },
+      "id": "5cbbdddc-3ffb-4df8-b6b1-6713bf65f8be",
+      "name": "Validate OTP Logic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -880,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "cond_otp",
+              "leftValue": "={{ $json.success }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equal"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fbbe76b9-95d8-430a-9eb4-26b6cf5bbf40",
+      "name": "OTP Verified?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -656,
+        720
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://YOUR_STORE.com/wp-json/wc/v3/orders/{{ $json.orderId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Basic YOUR_WC_BASE64_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"status\": \"processing\",\n  \"customer_note\": \"Order verified via OTP. Confirmed at {{ $now.toISO() }}\"\n}",
+        "options": {}
+      },
+      "id": "5bd9e43b-24a2-48ce-a4cf-f83c5c16e71b",
+      "name": "Confirm Order in WooCommerce",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -448,
+        656
+      ]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "=https://YOUR_STORE.com/wp-json/wc/v3/orders/{{ $json.orderId }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Basic YOUR_WC_BASE64_KEY"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"status\": \"cancelled\",\n  \"customer_note\": \"Order cancelled: OTP verification failed. Reason: {{ $json.reason }}\"\n}",
+        "options": {}
+      },
+      "id": "69239a7f-5a34-4de1-a40a-020cf5b3920f",
+      "name": "Cancel Unverified Order",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -448,
+        800
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "WooCommerce: New Order": {
+      "main": [
+        [
+          {
+            "node": "Get Customer Details",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Data Enrichment & Validation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Customer Details": {
+      "main": [
+        [
+          {
+            "node": "Fraud Check (Third-Party API)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fraud Check (Third-Party API)": {
+      "main": [
+        [
+          {
+            "node": "Merge Fraud Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Fraud Result": {
+      "main": [
+        [
+          {
+            "node": "Conditional Logic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Conditional Logic": {
+      "main": [
+        [
+          {
+            "node": "Generate WhatsApp Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Order for Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate WhatsApp Message": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp API",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp API": {
+      "main": [
+        [
+          {
+            "node": "Save OTP to DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Order for Review": {
+      "main": [
+        [
+          {
+            "node": "Update WC Order to On-Hold",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Data Enrichment & Validation": {
+      "main": [
+        [
+          {
+            "node": "Verify Phone Number",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Phone Number": {
+      "main": [
+        [
+          {
+            "node": "Prepare SMS Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare SMS Notification": {
+      "main": [
+        [
+          {
+            "node": "SMS Gateway",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SMS Gateway": {
+      "main": [
+        [
+          {
+            "node": "Save OTP to DB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save OTP to DB": {
+      "main": [
+        [
+          {
+            "node": "CRM Update & Analytics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OTP Verification Webhook": {
+      "main": [
+        [
+          {
+            "node": "Validate OTP Logic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate OTP Logic": {
+      "main": [
+        [
+          {
+            "node": "OTP Verified?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OTP Verified?": {
+      "main": [
+        [
+          {
+            "node": "Confirm Order in WooCommerce",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Cancel Unverified Order",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "9d562379-cdf0-4c69-b64e-b89ae21e1ad9",
+  "meta": {
+    "instanceId": "20cf75cd0417fe5be3c3d8dcf7163bcd4dd5f0947193527bf3d55f850ac76577"
+  },
+  "id": "KvIEQKqwiCqsrtJm",
+  "tags": []
+}
